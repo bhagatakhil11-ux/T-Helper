@@ -1,0 +1,6 @@
+{
+  "name": "QuantAI",
+  "description": "Autonomous AI quantitative trading system for NSE & BSE stocks with multi-factor strategy ensemble, risk guardrails, and real-time paper execution.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
