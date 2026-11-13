@@ -1,11 +1,14 @@
 package com.example.data.repository
 
 import com.example.data.local.HistoricalDataLocalStore
+import com.example.data.model.AdjustmentPolicy
 import com.example.data.model.Candle
+import com.example.data.model.DataOrigin
 import com.example.data.model.Exchange
 import com.example.data.model.FeedStatus
 import com.example.data.model.HistoricalDatasetMetadata
 import com.example.data.model.MarketInstrument
+import com.example.data.model.VerificationStatus
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -20,6 +23,12 @@ class MarketRepository(
 ) {
     private val _feedStatus = MutableStateFlow(FeedStatus.SIMULATED)
     val feedStatus: StateFlow<FeedStatus> = _feedStatus.asStateFlow()
+
+    private val _dataOrigin = MutableStateFlow(DataOrigin.SIMULATED)
+    val dataOrigin: StateFlow<DataOrigin> = _dataOrigin.asStateFlow()
+
+    private val _verificationStatus = MutableStateFlow(VerificationStatus.SIMULATED_NOT_REAL)
+    val verificationStatus: StateFlow<VerificationStatus> = _verificationStatus.asStateFlow()
 
     private val _dataSourceName = MutableStateFlow("NSE Paper Market Feed (Simulated)")
     val dataSourceName: StateFlow<String> = _dataSourceName.asStateFlow()
@@ -67,44 +76,79 @@ class MarketRepository(
         "${symbol.trim().uppercase()}|${timeframe.trim()}"
 
     /**
-     * Ingests validated genuine historical OHLCV candles into memory.
-     * Enforces strict provenance: synthetic/simulated candles are NEVER accepted as HISTORICAL.
+     * Ingests validated historical/fixture OHLCV candles into memory.
+     * Enforces strict provenance:
+     * - Rejects internal SIMULATED feed candles unless explicitly tagged DataOrigin.TEST_FIXTURE.
+     * - TEST_FIXTURE is never promoted to FeedStatus.HISTORICAL or VERIFIED market data.
      */
     fun ingestHistoricalCandles(
         symbol: String,
         candles: List<Candle>,
         timeframe: String = "1m",
         sourceName: String = "External Historical CSV",
-        metadata: HistoricalDatasetMetadata? = null
+        metadata: HistoricalDatasetMetadata? = null,
+        sourceType: DataOrigin = metadata?.sourceType ?: DataOrigin.IMPORTED_CSV,
+        verificationStatus: VerificationStatus = metadata?.verificationStatus ?: VerificationStatus.IMPORTED_CSV_UNVERIFIED
     ) {
         if (candles.isEmpty()) return
-        require(candles.none { it.feedStatus == FeedStatus.SIMULATED }) {
-            "Refusing to ingest simulated candles as historical market data."
+        require(sourceType != DataOrigin.SIMULATED && verificationStatus != VerificationStatus.SIMULATED_NOT_REAL) {
+            "Refusing to ingest simulated feed data into historical store."
+        }
+        if (sourceType != DataOrigin.TEST_FIXTURE) {
+            require(candles.none { it.feedStatus == FeedStatus.SIMULATED }) {
+                "Refusing to ingest simulated candles as historical market data."
+            }
+        }
+
+        val resolvedFeedStatus = if (sourceType == DataOrigin.TEST_FIXTURE) {
+            FeedStatus.SIMULATED
+        } else {
+            FeedStatus.HISTORICAL
+        }
+        val resolvedVerification = if (sourceType == DataOrigin.TEST_FIXTURE) {
+            VerificationStatus.TEST_FIXTURE_NOT_MARKET_DATA
+        } else {
+            verificationStatus
         }
 
         val normalizedSymbol = symbol.trim().uppercase()
-        val sortedHistorical = candles
-            .map { it.copy(feedStatus = FeedStatus.HISTORICAL) }
+        val sortedCandles = candles
+            .map { it.copy(feedStatus = resolvedFeedStatus) }
             .sortedBy { it.timestamp }
 
-        val key = datasetKey(normalizedSymbol, timeframe)
-        historicalCandleMap[key] = sortedHistorical
+        val checksum = metadata?.sha256Checksum?.takeIf { it.isNotBlank() }
+            ?: HistoricalCsvImporter.computeCandlesSha256(sortedCandles)
+        val datasetId = metadata?.datasetId?.takeIf { it.isNotBlank() }
+            ?: "${normalizedSymbol}_${timeframe}_${checksum.take(12)}"
 
-        val resolvedMeta = metadata ?: HistoricalDatasetMetadata(
+        val resolvedMeta = (metadata ?: HistoricalDatasetMetadata(
             symbol = normalizedSymbol,
             timeframe = timeframe,
             sourceName = sourceName,
-            feedStatus = FeedStatus.HISTORICAL,
+            feedStatus = resolvedFeedStatus,
             importedAt = System.currentTimeMillis(),
-            candleCount = sortedHistorical.size,
-            startTimestamp = sortedHistorical.first().timestamp,
-            endTimestamp = sortedHistorical.last().timestamp
+            candleCount = sortedCandles.size,
+            startTimestamp = sortedCandles.first().timestamp,
+            endTimestamp = sortedCandles.last().timestamp,
+            adjustmentPolicy = AdjustmentPolicy.UNKNOWN_UNVERIFIED
+        )).copy(
+            symbol = normalizedSymbol,
+            timeframe = timeframe,
+            feedStatus = resolvedFeedStatus,
+            sourceType = sourceType,
+            verificationStatus = resolvedVerification,
+            sha256Checksum = checksum,
+            datasetId = datasetId,
+            candleCount = sortedCandles.size
         )
+
+        val key = datasetKey(normalizedSymbol, timeframe)
+        historicalCandleMap[key] = sortedCandles
         _historicalDatasets.value = _historicalDatasets.value + (key to resolvedMeta)
 
-        // Ensure instrument exists in watchlist and reflects latest historical bar
-        val latest = sortedHistorical.last()
-        val first = sortedHistorical.first()
+        // Ensure instrument exists in watchlist and reflects latest bar + provenance
+        val latest = sortedCandles.last()
+        val first = sortedCandles.first()
         val existingList = _instruments.value.toMutableList()
         val idx = existingList.indexOfFirst { it.symbol == normalizedSymbol }
         val pctChg = if (first.open > 0) ((latest.close - first.open) / first.open) * 100.0 else 0.0
@@ -114,13 +158,13 @@ class MarketRepository(
             existingList[idx] = prev.copy(
                 currentPrice = latest.close,
                 openPrice = latest.open,
-                high24h = sortedHistorical.takeLast(50).maxOf { it.high },
-                low24h = sortedHistorical.takeLast(50).minOf { it.low },
+                high24h = sortedCandles.takeLast(50).maxOf { it.high },
+                low24h = sortedCandles.takeLast(50).minOf { it.low },
                 changePercent = pctChg,
                 volume = latest.volume,
                 bidPrice = latest.close - 0.05,
                 askPrice = latest.close + 0.05,
-                feedStatus = FeedStatus.HISTORICAL,
+                feedStatus = resolvedFeedStatus,
                 lastUpdated = latest.timestamp
             )
         } else {
@@ -132,12 +176,12 @@ class MarketRepository(
                     isTradable = true,
                     currentPrice = latest.close,
                     openPrice = latest.open,
-                    high24h = sortedHistorical.takeLast(50).maxOf { it.high },
-                    low24h = sortedHistorical.takeLast(50).minOf { it.low },
+                    high24h = sortedCandles.takeLast(50).maxOf { it.high },
+                    low24h = sortedCandles.takeLast(50).minOf { it.low },
                     changePercent = pctChg,
                     volume = latest.volume,
                     lotSize = 1,
-                    feedStatus = FeedStatus.HISTORICAL,
+                    feedStatus = resolvedFeedStatus,
                     lastUpdated = latest.timestamp
                 )
             )
@@ -156,9 +200,33 @@ class MarketRepository(
             candles = candles,
             timeframe = metadata.timeframe,
             sourceName = metadata.sourceName,
-            metadata = metadata
+            metadata = metadata,
+            sourceType = metadata.sourceType,
+            verificationStatus = metadata.verificationStatus
         )
-        localStore?.saveDataset(metadata, candles)
+        localStore?.saveDataset(
+            _historicalDatasets.value[datasetKey(metadata.symbol, metadata.timeframe)] ?: metadata,
+            candles
+        )
+    }
+
+    suspend fun persistAndIngestHistoricalBatch(
+        datasets: List<Pair<HistoricalDatasetMetadata, List<Candle>>>
+    ) {
+        if (datasets.isEmpty()) return
+        // First persist atomically to Room before updating in-memory state
+        localStore?.saveDatasetsBatch(datasets)
+        for ((meta, candles) in datasets) {
+            ingestHistoricalCandles(
+                symbol = meta.symbol,
+                candles = candles,
+                timeframe = meta.timeframe,
+                sourceName = meta.sourceName,
+                metadata = meta,
+                sourceType = meta.sourceType,
+                verificationStatus = meta.verificationStatus
+            )
+        }
     }
 
     suspend fun loadPersistedHistoricalDatasets() {
@@ -171,7 +239,9 @@ class MarketRepository(
                     candles = candles,
                     timeframe = meta.timeframe,
                     sourceName = meta.sourceName,
-                    metadata = meta
+                    metadata = meta,
+                    sourceType = meta.sourceType,
+                    verificationStatus = meta.verificationStatus
                 )
             }
         }
@@ -184,7 +254,6 @@ class MarketRepository(
         _historicalDatasets.value = _historicalDatasets.value - key
         localStore?.deleteDataset(normalizedSymbol, timeframe)
 
-        // Revert instrument feed status if no other historical dataset remains for symbol
         val stillHasHistorical = _historicalDatasets.value.values.any { it.symbol == normalizedSymbol }
         if (!stillHasHistorical) {
             _instruments.value = _instruments.value.map { inst ->
@@ -201,12 +270,12 @@ class MarketRepository(
         val exact = _historicalDatasets.value[datasetKey(normSym, timeframe)]
         if (exact != null) return exact
 
-        // Check if higher timeframe can be derived from imported historical 1m or 5m candles
         if (timeframe in listOf("5m", "15m", "1D")) {
             val base1m = _historicalDatasets.value[datasetKey(normSym, "1m")]
             if (base1m != null) {
                 return base1m.copy(
                     timeframe = timeframe,
+                    datasetId = "${base1m.datasetId}_agg_$timeframe",
                     sourceName = "${base1m.sourceName} (Aggregated from 1m)"
                 )
             }
@@ -216,6 +285,7 @@ class MarketRepository(
             if (base5m != null) {
                 return base5m.copy(
                     timeframe = timeframe,
+                    datasetId = "${base5m.datasetId}_agg_$timeframe",
                     sourceName = "${base5m.sourceName} (Aggregated from 5m)"
                 )
             }
@@ -224,7 +294,8 @@ class MarketRepository(
     }
 
     fun isUsingHistoricalData(symbol: String, timeframe: String): Boolean {
-        return getDatasetProvenance(symbol, timeframe) != null
+        val prov = getDatasetProvenance(symbol, timeframe) ?: return false
+        return prov.sourceType != DataOrigin.TEST_FIXTURE && prov.sourceType != DataOrigin.SIMULATED
     }
 
     fun refreshProvenance(symbol: String, timeframe: String) {
@@ -233,15 +304,21 @@ class MarketRepository(
         val histMeta = getDatasetProvenance(symbol, timeframe)
         when {
             histMeta != null -> {
-                _feedStatus.value = FeedStatus.HISTORICAL
-                _dataSourceName.value = "${histMeta.sourceName} (${histMeta.symbol} ${histMeta.timeframe}, ${histMeta.candleCount} bars)"
+                _feedStatus.value = histMeta.feedStatus
+                _dataOrigin.value = histMeta.sourceType
+                _verificationStatus.value = histMeta.verificationStatus
+                _dataSourceName.value = "${histMeta.verificationStatus.name}: ${histMeta.sourceName} (${histMeta.symbol} ${histMeta.timeframe}, ${histMeta.candleCount} bars)"
             }
             upstoxLiveActive -> {
                 _feedStatus.value = FeedStatus.LIVE
+                _dataOrigin.value = DataOrigin.BROKER_VENDOR
+                _verificationStatus.value = VerificationStatus.VERIFIED_EXCHANGE_OR_VENDOR
                 _dataSourceName.value = upstoxProvider.providerName
             }
             else -> {
                 _feedStatus.value = FeedStatus.SIMULATED
+                _dataOrigin.value = DataOrigin.SIMULATED
+                _verificationStatus.value = VerificationStatus.SIMULATED_NOT_REAL
                 _dataSourceName.value = "NSE Paper Market Feed (Simulated)"
             }
         }
@@ -309,11 +386,10 @@ class MarketRepository(
         val tickPrices = mutableMapOf<String, Double>()
 
         for (inst in _instruments.value) {
-            // Preserve genuine historical snapshot values for symbols currently backed by historical data
-            val hasHistorical = _historicalDatasets.value.values.any { it.symbol == inst.symbol }
-            if (hasHistorical && !upstoxLiveActive) {
+            val histMeta = _historicalDatasets.value.values.firstOrNull { it.symbol == inst.symbol }
+            if (histMeta != null && !upstoxLiveActive) {
                 tickPrices[inst.symbol] = inst.currentPrice
-                updatedList.add(inst.copy(feedStatus = FeedStatus.HISTORICAL))
+                updatedList.add(inst.copy(feedStatus = histMeta.feedStatus))
                 continue
             }
 

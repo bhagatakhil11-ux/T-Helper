@@ -11,9 +11,12 @@ import androidx.room.Query
 import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.room.Transaction
+import com.example.data.model.AdjustmentPolicy
 import com.example.data.model.Candle
+import com.example.data.model.DataOrigin
 import com.example.data.model.FeedStatus
 import com.example.data.model.HistoricalDatasetMetadata
+import com.example.data.model.VerificationStatus
 import kotlinx.coroutines.flow.Flow
 
 @Entity(
@@ -49,7 +52,15 @@ data class HistoricalDatasetMetaEntity(
     val duplicateCount: Int,
     val invalidRowCount: Int,
     val missingCandleCount: Int,
-    val warningsJoined: String
+    val warningsJoined: String,
+    val datasetId: String = "",
+    val sourceType: String = DataOrigin.IMPORTED_CSV.name,
+    val verificationStatus: String = VerificationStatus.IMPORTED_CSV_UNVERIFIED.name,
+    val sha256Checksum: String = "",
+    val timezone: String = "Asia/Kolkata",
+    val adjustmentPolicy: String = AdjustmentPolicy.UNKNOWN_UNVERIFIED.name,
+    val holidaySkippedCount: Int = 0,
+    val corporateActionFlagsJoined: String = ""
 )
 
 @Dao
@@ -85,9 +96,17 @@ interface HistoricalDataDao {
         deleteCandles(symbol, timeframe)
         deleteMeta(symbol, timeframe)
         upsertMeta(meta)
-        // Insert in chunks to avoid SQLite bind parameter limits on large CSVs
         candles.chunked(500).forEach { chunk ->
             insertCandles(chunk)
+        }
+    }
+
+    @Transaction
+    suspend fun replaceDatasetsBatch(
+        items: List<Pair<HistoricalDatasetMetaEntity, List<HistoricalCandleEntity>>>
+    ) {
+        for ((meta, candles) in items) {
+            replaceDataset(meta.symbol, meta.timeframe, meta, candles)
         }
     }
 
@@ -100,7 +119,7 @@ interface HistoricalDataDao {
 
 @Database(
     entities = [HistoricalCandleEntity::class, HistoricalDatasetMetaEntity::class],
-    version = 1,
+    version = 2,
     exportSchema = false
 )
 abstract class QuantDatabase : RoomDatabase() {
@@ -116,7 +135,10 @@ abstract class QuantDatabase : RoomDatabase() {
                     context.applicationContext,
                     QuantDatabase::class.java,
                     "quantai_market_history.db"
-                ).build().also { INSTANCE = it }
+                )
+                    .fallbackToDestructiveMigration(dropAllTables = true)
+                    .build()
+                    .also { INSTANCE = it }
             }
         }
     }
@@ -131,6 +153,19 @@ class HistoricalDataLocalStore(
     fun observeMetadata(): Flow<List<HistoricalDatasetMetaEntity>> = dao.observeAllDatasetMeta()
 
     suspend fun saveDataset(metadata: HistoricalDatasetMetadata, candles: List<Candle>) {
+        val (metaEntity, candleEntities) = toEntities(metadata, candles)
+        dao.replaceDataset(metadata.symbol, metadata.timeframe, metaEntity, candleEntities)
+    }
+
+    suspend fun saveDatasetsBatch(datasets: List<Pair<HistoricalDatasetMetadata, List<Candle>>>) {
+        val entities = datasets.map { (meta, candles) -> toEntities(meta, candles) }
+        dao.replaceDatasetsBatch(entities)
+    }
+
+    private fun toEntities(
+        metadata: HistoricalDatasetMetadata,
+        candles: List<Candle>
+    ): Pair<HistoricalDatasetMetaEntity, List<HistoricalCandleEntity>> {
         val metaEntity = HistoricalDatasetMetaEntity(
             symbol = metadata.symbol,
             timeframe = metadata.timeframe,
@@ -143,7 +178,15 @@ class HistoricalDataLocalStore(
             duplicateCount = metadata.duplicateCount,
             invalidRowCount = metadata.invalidRowCount,
             missingCandleCount = metadata.missingCandleCount,
-            warningsJoined = metadata.warnings.joinToString("\n")
+            warningsJoined = metadata.warnings.joinToString("\n"),
+            datasetId = metadata.datasetId,
+            sourceType = metadata.sourceType.name,
+            verificationStatus = metadata.verificationStatus.name,
+            sha256Checksum = metadata.sha256Checksum,
+            timezone = metadata.timezone,
+            adjustmentPolicy = metadata.adjustmentPolicy.name,
+            holidaySkippedCount = metadata.holidaySkippedCount,
+            corporateActionFlagsJoined = metadata.corporateActionFlags.joinToString("\n")
         )
         val candleEntities = candles.map { c ->
             HistoricalCandleEntity(
@@ -158,7 +201,7 @@ class HistoricalDataLocalStore(
                 feedStatus = c.feedStatus.name
             )
         }
-        dao.replaceDataset(metadata.symbol, metadata.timeframe, metaEntity, candleEntities)
+        return metaEntity to candleEntities
     }
 
     suspend fun loadAllDatasets(): List<Pair<HistoricalDatasetMetadata, List<Candle>>> {
@@ -187,7 +230,17 @@ class HistoricalDataLocalStore(
                 duplicateCount = m.duplicateCount,
                 invalidRowCount = m.invalidRowCount,
                 missingCandleCount = m.missingCandleCount,
-                warnings = if (m.warningsJoined.isBlank()) emptyList() else m.warningsJoined.split("\n")
+                warnings = if (m.warningsJoined.isBlank()) emptyList() else m.warningsJoined.split("\n"),
+                datasetId = m.datasetId,
+                sourceType = runCatching { DataOrigin.valueOf(m.sourceType) }.getOrDefault(DataOrigin.IMPORTED_CSV),
+                verificationStatus = runCatching { VerificationStatus.valueOf(m.verificationStatus) }
+                    .getOrDefault(VerificationStatus.IMPORTED_CSV_UNVERIFIED),
+                sha256Checksum = m.sha256Checksum,
+                timezone = m.timezone.ifBlank { "Asia/Kolkata" },
+                adjustmentPolicy = runCatching { AdjustmentPolicy.valueOf(m.adjustmentPolicy) }
+                    .getOrDefault(AdjustmentPolicy.UNKNOWN_UNVERIFIED),
+                holidaySkippedCount = m.holidaySkippedCount,
+                corporateActionFlags = if (m.corporateActionFlagsJoined.isBlank()) emptyList() else m.corporateActionFlagsJoined.split("\n")
             )
             meta to candles
         }

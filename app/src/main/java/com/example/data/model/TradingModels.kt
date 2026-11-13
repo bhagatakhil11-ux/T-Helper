@@ -15,6 +15,59 @@ enum class FeedStatus {
     DISCONNECTED
 }
 
+enum class DataOrigin {
+    SIMULATED,
+    TEST_FIXTURE,
+    IMPORTED_CSV,
+    BROKER_VENDOR
+}
+
+enum class VerificationStatus {
+    SIMULATED_NOT_REAL,
+    TEST_FIXTURE_NOT_MARKET_DATA,
+    IMPORTED_CSV_UNVERIFIED,
+    VERIFIED_EXCHANGE_OR_VENDOR
+}
+
+enum class AdjustmentPolicy {
+    UNKNOWN_UNVERIFIED,
+    UNADJUSTED,
+    SPLIT_AND_BONUS_ADJUSTED
+}
+
+enum class ResearchQualityStatus {
+    RESEARCH_GRADE,
+    LOW_CONFIDENCE_INSUFFICIENT_DATA
+}
+
+object DataQualityThresholds {
+    const val MIN_SMOKE_TEST_BARS = 80
+
+    val defaultResearchMinBars: Map<String, Int> = mapOf(
+        "1D" to 1500,   // ~6 NSE trading years
+        "15m" to 7500,  // ~300 sessions
+        "5m" to 15000,  // ~200 sessions
+        "1m" to 30000   // ~80 sessions
+    )
+
+    fun requiredResearchBars(
+        timeframe: String,
+        overrides: Map<String, Int> = defaultResearchMinBars
+    ): Int = overrides[timeframe] ?: 1500
+
+    fun evaluateQuality(
+        candleCount: Int,
+        timeframe: String,
+        overrides: Map<String, Int> = defaultResearchMinBars
+    ): ResearchQualityStatus {
+        return if (candleCount >= requiredResearchBars(timeframe, overrides)) {
+            ResearchQualityStatus.RESEARCH_GRADE
+        } else {
+            ResearchQualityStatus.LOW_CONFIDENCE_INSUFFICIENT_DATA
+        }
+    }
+}
+
 enum class MarketSession {
     PRE_OPEN,        // 09:00 - 09:15 IST
     REGULAR_HOURS,   // 09:15 - 15:30 IST
@@ -175,7 +228,14 @@ data class MlValidationReport(
     val featureImportances: Map<String, Double>,
     val passedValidationGate: Boolean,
     val validationGateReason: String,
-    val testStartCandleIndex: Int = -1
+    val testStartCandleIndex: Int = -1,
+    val datasetId: String = "",
+    val datasetChecksum: String = "",
+    val featureVersion: String = "features-v1.0",
+    val sourceType: DataOrigin = DataOrigin.SIMULATED,
+    val verificationStatus: VerificationStatus = VerificationStatus.SIMULATED_NOT_REAL,
+    val researchQualityStatus: ResearchQualityStatus = ResearchQualityStatus.LOW_CONFIDENCE_INSUFFICIENT_DATA,
+    val researchMinRequiredBars: Int = 1500
 )
 
 data class MlPrediction(
@@ -190,7 +250,11 @@ data class MlPrediction(
     val trainingSampleCount: Int,
     val outOfSampleAccuracy: Double,
     val featureImportances: Map<String, Double> = emptyMap(),
-    val evaluatedAt: Long = System.currentTimeMillis()
+    val evaluatedAt: Long = System.currentTimeMillis(),
+    val datasetId: String = "",
+    val featureVersion: String = "features-v1.0",
+    val sourceType: DataOrigin = DataOrigin.SIMULATED,
+    val verificationStatus: VerificationStatus = VerificationStatus.SIMULATED_NOT_REAL
 )
 
 data class DecisionSignal(
@@ -249,7 +313,7 @@ data class BacktestResult(
     val winRatePercent: Double,
     val profitFactor: Double,
     val maxDrawdownPercent: Double,
-    val sharpeRatio: Double,
+    val sharpeRatio: Double?,
     val expectancy: Double,
     val netProfit: Double,
     val netProfitPercent: Double,
@@ -264,7 +328,15 @@ data class BacktestResult(
     val startTimestamp: Long = 0L,
     val endTimestamp: Long = 0L,
     val evaluationScope: String = "Full Series",
-    val mlValidationReport: MlValidationReport? = null
+    val mlValidationReport: MlValidationReport? = null,
+    val datasetId: String = "",
+    val datasetChecksum: String = "",
+    val sourceType: DataOrigin = DataOrigin.SIMULATED,
+    val verificationStatus: VerificationStatus = VerificationStatus.SIMULATED_NOT_REAL,
+    val sharpeStatusReason: String = "",
+    val executionAssumption: String = "Signal at Bar[t] Close -> Next-Bar Bar[t+1] Open + Slippage",
+    val costModelSummary: String = "",
+    val researchQualityStatus: ResearchQualityStatus = ResearchQualityStatus.LOW_CONFIDENCE_INSUFFICIENT_DATA
 )
 
 data class HistoricalDatasetMetadata(
@@ -279,7 +351,15 @@ data class HistoricalDatasetMetadata(
     val duplicateCount: Int = 0,
     val invalidRowCount: Int = 0,
     val missingCandleCount: Int = 0,
-    val warnings: List<String> = emptyList()
+    val warnings: List<String> = emptyList(),
+    val datasetId: String = "",
+    val sourceType: DataOrigin = DataOrigin.IMPORTED_CSV,
+    val verificationStatus: VerificationStatus = VerificationStatus.IMPORTED_CSV_UNVERIFIED,
+    val sha256Checksum: String = "",
+    val timezone: String = "Asia/Kolkata",
+    val adjustmentPolicy: AdjustmentPolicy = AdjustmentPolicy.UNKNOWN_UNVERIFIED,
+    val holidaySkippedCount: Int = 0,
+    val corporateActionFlags: List<String> = emptyList()
 )
 
 data class HistoricalImportResult(

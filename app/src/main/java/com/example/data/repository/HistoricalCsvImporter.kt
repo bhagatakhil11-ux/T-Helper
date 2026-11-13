@@ -1,27 +1,83 @@
 package com.example.data.repository
 
+import com.example.data.model.AdjustmentPolicy
 import com.example.data.model.BatchHistoricalImportResult
 import com.example.data.model.Candle
+import com.example.data.model.DataOrigin
 import com.example.data.model.FeedStatus
 import com.example.data.model.HistoricalDatasetMetadata
 import com.example.data.model.HistoricalImportResult
+import com.example.data.model.VerificationStatus
 import java.io.BufferedReader
 import java.io.InputStream
 import java.io.InputStreamReader
+import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
 import java.util.TimeZone
+import kotlin.math.abs
 
 /**
- * Strict CSV parser, validator, chronological sorter, and gap detector
- * for genuine historical NSE equity OHLCV datasets.
+ * NSE Equity Trading Session & Holiday Calendar helper (Asia/Kolkata).
+ * Note: Includes fixed annual national/state holidays and published NSE exchange holidays (2024-2026),
+ * plus optional user-supplied holiday overrides. Unlisted historical variable lunar holidays
+ * remain flagged as weekday gaps with a note indicating possible exchange holidays.
+ */
+object NseHolidayCalendar {
+    private val IST_TZ: TimeZone = TimeZone.getTimeZone("Asia/Kolkata")
+
+    private val FIXED_ANNUAL_MONTH_DAY = setOf(
+        "01-26", // Republic Day
+        "05-01", // Maharashtra Day
+        "08-15", // Independence Day
+        "10-02", // Mahatma Gandhi Jayanti
+        "12-25"  // Christmas
+    )
+
+    // Known NSE Equity trading holidays (variable dates across 2024-2026)
+    private val KNOWN_EXCHANGE_HOLIDAYS = setOf(
+        // 2024
+        "2024-01-22", "2024-03-08", "2024-03-25", "2024-03-29", "2024-04-11",
+        "2024-04-17", "2024-05-20", "2024-06-17", "2024-07-17", "2024-11-01", "2024-11-15",
+        // 2025
+        "2025-02-26", "2025-03-14", "2025-03-31", "2025-04-10", "2025-04-14",
+        "2025-04-18", "2025-08-27", "2025-10-21", "2025-10-22", "2025-11-05",
+        // 2026
+        "2026-01-15", "2026-03-03", "2026-03-26", "2026-03-31", "2026-04-03",
+        "2026-04-14", "2026-05-28", "2026-06-26", "2026-09-14", "2026-10-20",
+        "2026-11-10", "2026-11-24"
+    )
+
+    fun isHoliday(dateYyyyMmDd: String, customHolidays: Set<String> = emptySet()): Boolean {
+        if (dateYyyyMmDd.length < 10) return false
+        val mmDd = dateYyyyMmDd.substring(5, 10)
+        return mmDd in FIXED_ANNUAL_MONTH_DAY ||
+            dateYyyyMmDd in KNOWN_EXCHANGE_HOLIDAYS ||
+            dateYyyyMmDd in customHolidays
+    }
+
+    /**
+     * Checks whether an IST timestamp falls inside regular NSE continuous session (09:15..15:30 IST).
+     */
+    fun isWithinRegularNseSession(epochMs: Long): Boolean {
+        val cal = Calendar.getInstance(IST_TZ).apply { timeInMillis = epochMs }
+        val dow = cal.get(Calendar.DAY_OF_WEEK)
+        if (dow == Calendar.SATURDAY || dow == Calendar.SUNDAY) return false
+        val minutes = cal.get(Calendar.HOUR_OF_DAY) * 60 + cal.get(Calendar.MINUTE)
+        return minutes in (9 * 60 + 15)..(15 * 60 + 30)
+    }
+}
+
+/**
+ * Strict CSV parser, validator, chronological sorter, SHA-256 checksum builder,
+ * corporate-action discontinuity detector, and NSE-aware gap detector.
  *
  * Design guarantees:
  * - Never silently modifies invalid prices, OHLC relationships, volumes, or timestamps.
  * - Rejects duplicates, negative/zero prices, inverted OHLC bars, negative volume, and malformed rows.
- * - Explicitly marks every accepted bar as FeedStatus.HISTORICAL.
- * - Preserves symbol isolation when importing multi-symbol CSV files.
+ * - Explicitly distinguishes SIMULATED, TEST_FIXTURE, IMPORTED_CSV_UNVERIFIED, and VERIFIED data.
+ * - Preserves symbol isolation and enforces atomic multi-symbol batch failure if any symbol completely fails.
  */
 object HistoricalCsvImporter {
 
@@ -64,6 +120,11 @@ object HistoricalCsvImporter {
         timeframe: String,
         sourceName: String,
         useSymbolColumnIfPresent: Boolean = true,
+        sourceType: DataOrigin = DataOrigin.IMPORTED_CSV,
+        verificationStatus: VerificationStatus = VerificationStatus.IMPORTED_CSV_UNVERIFIED,
+        adjustmentPolicy: AdjustmentPolicy = AdjustmentPolicy.UNKNOWN_UNVERIFIED,
+        customHolidays: Set<String> = emptySet(),
+        atomicMultiSymbol: Boolean = true,
         nowMs: Long = System.currentTimeMillis()
     ): BatchHistoricalImportResult {
         val reader = BufferedReader(InputStreamReader(inputStream, Charsets.UTF_8))
@@ -73,6 +134,11 @@ object HistoricalCsvImporter {
             timeframe = timeframe,
             sourceName = sourceName,
             useSymbolColumnIfPresent = useSymbolColumnIfPresent,
+            sourceType = sourceType,
+            verificationStatus = verificationStatus,
+            adjustmentPolicy = adjustmentPolicy,
+            customHolidays = customHolidays,
+            atomicMultiSymbol = atomicMultiSymbol,
             nowMs = nowMs
         )
     }
@@ -83,6 +149,11 @@ object HistoricalCsvImporter {
         timeframe: String,
         sourceName: String,
         useSymbolColumnIfPresent: Boolean = true,
+        sourceType: DataOrigin = DataOrigin.IMPORTED_CSV,
+        verificationStatus: VerificationStatus = VerificationStatus.IMPORTED_CSV_UNVERIFIED,
+        adjustmentPolicy: AdjustmentPolicy = AdjustmentPolicy.UNKNOWN_UNVERIFIED,
+        customHolidays: Set<String> = emptySet(),
+        atomicMultiSymbol: Boolean = true,
         nowMs: Long = System.currentTimeMillis()
     ): BatchHistoricalImportResult {
         return parseAndValidateLines(
@@ -91,6 +162,11 @@ object HistoricalCsvImporter {
             timeframe = timeframe,
             sourceName = sourceName,
             useSymbolColumnIfPresent = useSymbolColumnIfPresent,
+            sourceType = sourceType,
+            verificationStatus = verificationStatus,
+            adjustmentPolicy = adjustmentPolicy,
+            customHolidays = customHolidays,
+            atomicMultiSymbol = atomicMultiSymbol,
             nowMs = nowMs
         )
     }
@@ -101,8 +177,35 @@ object HistoricalCsvImporter {
         timeframe: String,
         sourceName: String,
         useSymbolColumnIfPresent: Boolean,
+        sourceType: DataOrigin,
+        verificationStatus: VerificationStatus,
+        adjustmentPolicy: AdjustmentPolicy,
+        customHolidays: Set<String>,
+        atomicMultiSymbol: Boolean,
         nowMs: Long
     ): BatchHistoricalImportResult {
+        if (sourceType == DataOrigin.SIMULATED) {
+            return BatchHistoricalImportResult(
+                success = false,
+                errors = listOf("Refusing to import SIMULATED data into HistoricalCsvImporter.")
+            )
+        }
+        val resolvedVerification = when (sourceType) {
+            DataOrigin.TEST_FIXTURE -> VerificationStatus.TEST_FIXTURE_NOT_MARKET_DATA
+            DataOrigin.IMPORTED_CSV -> if (verificationStatus == VerificationStatus.VERIFIED_EXCHANGE_OR_VENDOR) {
+                VerificationStatus.VERIFIED_EXCHANGE_OR_VENDOR
+            } else {
+                VerificationStatus.IMPORTED_CSV_UNVERIFIED
+            }
+            DataOrigin.BROKER_VENDOR -> verificationStatus
+            DataOrigin.SIMULATED -> VerificationStatus.SIMULATED_NOT_REAL
+        }
+        val candleFeedStatus = if (sourceType == DataOrigin.TEST_FIXTURE) {
+            FeedStatus.SIMULATED
+        } else {
+            FeedStatus.HISTORICAL
+        }
+
         if (timeframe !in SUPPORTED_TIMEFRAMES) {
             return BatchHistoricalImportResult(
                 success = false,
@@ -156,8 +259,8 @@ object HistoricalCsvImporter {
         val globalErrors = mutableListOf<String>()
         val globalWarnings = mutableListOf<String>()
 
-        // Partition strictly by symbol so multiple symbols in a CSV never mix
         val symbolBuckets = linkedMapOf<String, MutableList<ParsedRow>>()
+        val seenSymbolsInFile = linkedSetOf<String>()
         val seenTimestampsBySymbol = mutableMapOf<String, HashSet<Long>>()
         val rejectedBySymbol = mutableMapOf<String, Int>()
         val duplicatesBySymbol = mutableMapOf<String, Int>()
@@ -188,6 +291,7 @@ object HistoricalCsvImporter {
             } else {
                 normalizedDefaultSymbol
             }
+            seenSymbolsInFile.add(rowSymbol)
 
             val tsRaw = cells[colMap.timestampIdx].trim()
             val timestamp = parseTimestamp(tsRaw, dateParsers)
@@ -266,7 +370,7 @@ object HistoricalCsvImporter {
                 low = low,
                 close = close,
                 volume = volume,
-                feedStatus = FeedStatus.HISTORICAL
+                feedStatus = candleFeedStatus
             )
             symbolBuckets.getOrPut(rowSymbol) { mutableListOf() }.add(ParsedRow(lineNumber, rowSymbol, candle))
         }
@@ -278,13 +382,21 @@ object HistoricalCsvImporter {
             )
         }
 
-        if (symbolBuckets.isEmpty()) {
+        val emptyFailedSymbols = seenSymbolsInFile.filter { (symbolBuckets[it]?.size ?: 0) == 0 }
+        if (symbolBuckets.isEmpty() || (atomicMultiSymbol && emptyFailedSymbols.isNotEmpty())) {
+            val atomicErr = if (emptyFailedSymbols.isNotEmpty() && symbolBuckets.isNotEmpty()) {
+                listOf("Atomic multi-symbol import aborted: symbol(s) ${emptyFailedSymbols.joinToString(", ")} had 0 valid rows.") + globalErrors
+            } else if (globalErrors.isNotEmpty()) {
+                globalErrors
+            } else {
+                listOf("All $totalRowsRead rows failed OHLCV validation.")
+            }
             return BatchHistoricalImportResult(
                 success = false,
                 totalRowsRead = totalRowsRead,
                 totalRejectedRows = totalRejected,
                 totalDuplicates = totalDuplicates,
-                errors = if (globalErrors.isNotEmpty()) globalErrors else listOf("All $totalRowsRead rows failed OHLCV validation.")
+                errors = atomicErr
             )
         }
 
@@ -298,8 +410,20 @@ object HistoricalCsvImporter {
             val symRejected = rejectedBySymbol[sym] ?: 0
             val symDuplicates = duplicatesBySymbol[sym] ?: 0
 
-            val gapReport = detectGaps(sortedCandles, timeframe)
+            val gapReport = detectGaps(sortedCandles, timeframe, customHolidays)
+            val corporateActionFlags = detectCorporateActionDiscontinuities(sortedCandles, sym, adjustmentPolicy)
+            val checksum = computeCandlesSha256(sortedCandles)
+            val datasetId = "${sym}_${timeframe}_${checksum.take(12)}"
+
             val symWarnings = mutableListOf<String>()
+            if (resolvedVerification == VerificationStatus.IMPORTED_CSV_UNVERIFIED) {
+                symWarnings.add("Unverified external CSV import ($sym $timeframe); source authenticity is not exchange-verified.")
+            } else if (resolvedVerification == VerificationStatus.TEST_FIXTURE_NOT_MARKET_DATA) {
+                symWarnings.add("Synthetic/deterministic TEST FIXTURE ($sym $timeframe) — not genuine NSE historical market data.")
+            }
+            if (adjustmentPolicy == AdjustmentPolicy.UNKNOWN_UNVERIFIED || adjustmentPolicy == AdjustmentPolicy.UNADJUSTED) {
+                symWarnings.add("Corporate-action policy is ${adjustmentPolicy.name}; splits/bonuses/symbol changes are NOT auto-adjusted.")
+            }
             if (wasOutOfOrder) {
                 symWarnings.add("Input rows for $sym were unsorted and have been ordered chronologically.")
             }
@@ -310,12 +434,13 @@ object HistoricalCsvImporter {
                 symWarnings.add("Rejected ${symRejected - symDuplicates} invalid OHLCV row(s) for $sym.")
             }
             symWarnings.addAll(gapReport.warnings)
+            symWarnings.addAll(corporateActionFlags)
 
             val meta = HistoricalDatasetMetadata(
                 symbol = sym,
                 timeframe = timeframe,
                 sourceName = sourceName,
-                feedStatus = FeedStatus.HISTORICAL,
+                feedStatus = candleFeedStatus,
                 importedAt = nowMs,
                 candleCount = sortedCandles.size,
                 startTimestamp = sortedCandles.first().timestamp,
@@ -323,7 +448,15 @@ object HistoricalCsvImporter {
                 duplicateCount = symDuplicates,
                 invalidRowCount = symRejected - symDuplicates,
                 missingCandleCount = gapReport.missingCandleCount,
-                warnings = symWarnings
+                warnings = symWarnings,
+                datasetId = datasetId,
+                sourceType = sourceType,
+                verificationStatus = resolvedVerification,
+                sha256Checksum = checksum,
+                timezone = "Asia/Kolkata",
+                adjustmentPolicy = adjustmentPolicy,
+                holidaySkippedCount = gapReport.holidaySkippedCount,
+                corporateActionFlags = corporateActionFlags
             )
 
             datasetResults.add(
@@ -364,41 +497,88 @@ object HistoricalCsvImporter {
         )
     }
 
+    fun computeCandlesSha256(candles: List<Candle>): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        for (c in candles) {
+            val row = "${c.timestamp},${c.open},${c.high},${c.low},${c.close},${c.volume}\n"
+            digest.update(row.toByteArray(Charsets.UTF_8))
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    /**
+     * Flags extreme single-bar price discontinuities (>= 22% overnight/close-to-open change)
+     * that typically indicate an unadjusted stock split, bonus issue, or symbol merge.
+     * Never modifies prices automatically.
+     */
+    private fun detectCorporateActionDiscontinuities(
+        sortedCandles: List<Candle>,
+        symbol: String,
+        policy: AdjustmentPolicy
+    ): List<String> {
+        if (sortedCandles.size < 2) return emptyList()
+        val dateFmt = SimpleDateFormat("yyyy-MM-dd", Locale.US).apply { timeZone = IST_TZ }
+        val flags = mutableListOf<String>()
+        for (i in 1 until sortedCandles.size) {
+            val prevClose = sortedCandles[i - 1].close
+            val currOpen = sortedCandles[i].open
+            if (prevClose > 0.0) {
+                val pctJump = (currOpen - prevClose) / prevClose
+                if (abs(pctJump) >= 0.22) {
+                    val dateStr = dateFmt.format(sortedCandles[i].timestamp)
+                    flags.add(
+                        "Potential unadjusted corporate action on $symbol ($dateStr): ${String.format(Locale.US, "%.1f", pctJump * 100.0)}% close-to-open jump (policy=${policy.name})."
+                    )
+                }
+            }
+        }
+        return flags.take(5)
+    }
+
     private data class GapReport(
         val missingCandleCount: Int,
+        val holidaySkippedCount: Int,
         val warnings: List<String>
     )
 
-    private fun detectGaps(sortedCandles: List<Candle>, timeframe: String): GapReport {
-        if (sortedCandles.size < 2) return GapReport(0, emptyList())
+    private fun detectGaps(
+        sortedCandles: List<Candle>,
+        timeframe: String,
+        customHolidays: Set<String>
+    ): GapReport {
+        if (sortedCandles.size < 2) return GapReport(0, 0, emptyList())
 
         val warnings = mutableListOf<String>()
         var missingCount = 0
+        var holidaySkipped = 0
         val calPrev = Calendar.getInstance(IST_TZ)
         val calCurr = Calendar.getInstance(IST_TZ)
         val dateFmt = SimpleDateFormat("yyyy-MM-dd", Locale.US).apply { timeZone = IST_TZ }
 
         if (timeframe == "1D") {
-            var largestSkippedWeekdays = 0
             var largestGapDate = ""
+            var largestMissing = 0
             for (i in 1 until sortedCandles.size) {
                 val prevTs = sortedCandles[i - 1].timestamp
                 val currTs = sortedCandles[i].timestamp
-                val weekdaysBetween = countWeekdaysStrictlyBetween(prevTs, currTs)
-                if (weekdaysBetween > 0) {
-                    missingCount += weekdaysBetween
-                    if (weekdaysBetween > largestSkippedWeekdays) {
-                        largestSkippedWeekdays = weekdaysBetween
+                val (missingWeekdays, holidaysBetween) = countMissingTradingDaysBetween(
+                    prevTs, currTs, dateFmt, customHolidays
+                )
+                holidaySkipped += holidaysBetween
+                if (missingWeekdays > 0) {
+                    missingCount += missingWeekdays
+                    if (missingWeekdays > largestMissing) {
+                        largestMissing = missingWeekdays
                         largestGapDate = dateFmt.format(currTs)
                     }
                 }
             }
             if (missingCount > 0) {
                 warnings.add(
-                    "Detected $missingCount missing weekday daily bar(s) before $largestGapDate (missing trading days or NSE holidays)."
+                    "Detected $missingCount non-holiday weekday gap(s) before $largestGapDate (missing sessions or unlisted variable NSE exchange holidays)."
                 )
             }
-            return GapReport(missingCount, warnings)
+            return GapReport(missingCount, holidaySkipped, warnings)
         }
 
         val intervalMs = when (timeframe) {
@@ -436,7 +616,11 @@ object HistoricalCsvImporter {
                     }
                 }
             } else {
-                skippedSessionDays += countWeekdaysStrictlyBetween(prevTs, currTs)
+                val (missingSessions, holidaysBetween) = countMissingTradingDaysBetween(
+                    prevTs, currTs, dateFmt, customHolidays
+                )
+                skippedSessionDays += missingSessions
+                holidaySkipped += holidaysBetween
             }
         }
 
@@ -447,40 +631,55 @@ object HistoricalCsvImporter {
         }
         if (skippedSessionDays > 0) {
             warnings.add(
-                "Detected $skippedSessionDays skipped weekday session(s) between trading days (missing sessions or NSE holidays)."
+                "Detected $skippedSessionDays non-holiday weekday gap(s) between trading days (missing sessions or unlisted NSE holidays)."
             )
         }
 
-        return GapReport(missingCount, warnings)
+        return GapReport(missingCount, holidaySkipped, warnings)
     }
 
-    private fun countWeekdaysStrictlyBetween(startMs: Long, endMs: Long): Int {
-        val cal = Calendar.getInstance(IST_TZ)
-        cal.timeInMillis = startMs
-        cal.set(Calendar.HOUR_OF_DAY, 0)
-        cal.set(Calendar.MINUTE, 0)
-        cal.set(Calendar.SECOND, 0)
-        cal.set(Calendar.MILLISECOND, 0)
+    /**
+     * Returns Pair(nonHolidayWeekdaysBetween, knownHolidaysBetween) strictly between startMs and endMs in IST.
+     */
+    private fun countMissingTradingDaysBetween(
+        startMs: Long,
+        endMs: Long,
+        dateFmt: SimpleDateFormat,
+        customHolidays: Set<String>
+    ): Pair<Int, Int> {
+        val cal = Calendar.getInstance(IST_TZ).apply {
+            timeInMillis = startMs
+            set(Calendar.HOUR_OF_DAY, 0)
+            set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+        }
+        val endCal = Calendar.getInstance(IST_TZ).apply {
+            timeInMillis = endMs
+            set(Calendar.HOUR_OF_DAY, 0)
+            set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+        }
 
-        val endCal = Calendar.getInstance(IST_TZ)
-        endCal.timeInMillis = endMs
-        endCal.set(Calendar.HOUR_OF_DAY, 0)
-        endCal.set(Calendar.MINUTE, 0)
-        endCal.set(Calendar.SECOND, 0)
-        endCal.set(Calendar.MILLISECOND, 0)
-
-        var count = 0
+        var missingWeekdays = 0
+        var holidaysSkipped = 0
         cal.add(Calendar.DAY_OF_MONTH, 1)
         var guard = 0
         while (cal.before(endCal) && guard < 3650) {
             val dow = cal.get(Calendar.DAY_OF_WEEK)
             if (dow != Calendar.SATURDAY && dow != Calendar.SUNDAY) {
-                count++
+                val dateKey = dateFmt.format(cal.timeInMillis)
+                if (NseHolidayCalendar.isHoliday(dateKey, customHolidays)) {
+                    holidaysSkipped++
+                } else {
+                    missingWeekdays++
+                }
             }
             cal.add(Calendar.DAY_OF_MONTH, 1)
             guard++
         }
-        return count
+        return missingWeekdays to holidaysSkipped
     }
 
     private fun detectDelimiter(header: String): Char {
@@ -571,12 +770,12 @@ object HistoricalCsvImporter {
         val trimmed = raw.trim()
         if (trimmed.isEmpty()) return null
 
-        // Epoch seconds or milliseconds
+        // Epoch seconds (1990..2286 -> 631,152,000 .. 9,999,999,999) or milliseconds (>= 100,000,000,000)
         if (trimmed.all { it.isDigit() }) {
             val num = trimmed.toLongOrNull() ?: return null
             return when {
-                trimmed.length >= 13 -> num
-                trimmed.length in 9..11 -> num * 1000L
+                num >= 100_000_000_000L -> num
+                num in 631_152_000L..9_999_999_999L -> num * 1000L
                 else -> null
             }
         }

@@ -59,6 +59,8 @@ import com.example.data.model.BacktestResult
 import com.example.data.model.DecisionType
 import com.example.data.model.FeedStatus
 import com.example.data.model.MlMovementClass
+import com.example.data.model.ResearchQualityStatus
+import com.example.data.model.VerificationStatus
 import com.example.data.model.formatInr
 import com.example.engine.indicators.CandlestickPattern
 import java.text.SimpleDateFormat
@@ -283,12 +285,17 @@ fun StrategyLabScreen(viewModel: TradingViewModel) {
                             Text("QuantAI Random Forest", color = TextWhite, fontSize = 14.sp, fontWeight = FontWeight.Bold)
                             val statusTag = when {
                                 ml?.isTrained != true -> "UNTRAINED (Rule Ensemble Active)"
-                                ml.isSyntheticData -> "${ml.modelVersion} • SIMULATED DATA"
-                                else -> "${ml.modelVersion} • HISTORICAL DATA"
+                                else -> "${ml.modelVersion} • ${ml.featureVersion} • ${ml.verificationStatus.name}"
+                            }
+                            val statusTagColor = when {
+                                ml?.isTrained != true -> TextSubtle
+                                ml.verificationStatus == VerificationStatus.VERIFIED_EXCHANGE_OR_VENDOR -> QuantGreen
+                                ml.verificationStatus == VerificationStatus.IMPORTED_CSV_UNVERIFIED -> QuantCyan
+                                else -> QuantGold
                             }
                             Text(
                                 text = statusTag,
-                                color = if (ml?.isTrained == true && !ml.isSyntheticData) QuantGreen else if (ml?.isTrained == true) QuantGold else TextSubtle,
+                                color = statusTagColor,
                                 fontSize = 10.sp
                             )
                         }
@@ -391,9 +398,14 @@ fun StrategyLabScreen(viewModel: TradingViewModel) {
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
+                            val repColor = when (rep.verificationStatus) {
+                                VerificationStatus.VERIFIED_EXCHANGE_OR_VENDOR -> QuantGreen
+                                VerificationStatus.IMPORTED_CSV_UNVERIFIED -> QuantCyan
+                                else -> QuantGold
+                            }
                             Text(
-                                text = if (rep.isSyntheticData) "VALIDATION (SYNTHETIC FEED)" else "VALIDATION (HISTORICAL FEED)",
-                                color = if (rep.isSyntheticData) QuantGold else QuantGreen,
+                                text = "VALIDATION (${rep.verificationStatus.name})",
+                                color = repColor,
                                 fontSize = 10.sp,
                                 fontWeight = FontWeight.Bold
                             )
@@ -404,6 +416,12 @@ fun StrategyLabScreen(viewModel: TradingViewModel) {
                                 fontFamily = FontFamily.Monospace
                             )
                         }
+                        Text(
+                            text = "Dataset: ${rep.datasetId.ifBlank { "SIMULATED" }} | ${rep.featureVersion} | ${rep.researchQualityStatus.name} (req >= ${rep.researchMinRequiredBars})",
+                            color = if (rep.researchQualityStatus == ResearchQualityStatus.RESEARCH_GRADE) QuantGreen else QuantGold,
+                            fontSize = 9.sp,
+                            fontFamily = FontFamily.Monospace
+                        )
 
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -524,9 +542,9 @@ fun StrategyLabScreen(viewModel: TradingViewModel) {
             }
         }
 
-        // Historical Backtesting Lab Card
+        // Single-Series & Holdout Backtesting Lab Card
         Text(
-            text = "HISTORICAL WALK-FORWARD BACKTESTER",
+            text = "SINGLE-SERIES & HOLDOUT BACKTESTER",
             color = TextSubtle,
             fontSize = 11.sp,
             fontWeight = FontWeight.SemiBold,
@@ -635,9 +653,11 @@ fun StrategyLabScreen(viewModel: TradingViewModel) {
                 // Backtest Results Metrics Grid
                 if (backtestResult != null) {
                     val b = backtestResult!!
-                    val isHist = b.feedStatus == FeedStatus.HISTORICAL
-                    val statusColor = if (isHist) QuantGreen else QuantGold
-                    val statusBg = if (isHist) QuantGreenDim else Color(0x33FFC107)
+                    val (statusColor, statusBg) = when (b.verificationStatus) {
+                        VerificationStatus.VERIFIED_EXCHANGE_OR_VENDOR -> QuantGreen to QuantGreenDim
+                        VerificationStatus.IMPORTED_CSV_UNVERIFIED -> QuantCyan to QuantCyanDim
+                        else -> QuantGold to Color(0x33FFC107)
+                    }
 
                     // Provenance & Evaluation Scope Strip
                     Column(
@@ -659,7 +679,7 @@ fun StrategyLabScreen(viewModel: TradingViewModel) {
                                     .padding(horizontal = 6.dp, vertical = 2.dp)
                             ) {
                                 Text(
-                                    text = "${b.feedStatus.name} BACKTEST",
+                                    text = b.verificationStatus.name,
                                     color = statusColor,
                                     fontSize = 9.sp,
                                     fontWeight = FontWeight.Bold
@@ -672,8 +692,18 @@ fun StrategyLabScreen(viewModel: TradingViewModel) {
                                 fontFamily = FontFamily.Monospace
                             )
                         }
-                        Text("Source: ${b.sourceName}", color = TextMuted, fontSize = 10.sp)
+                        Text("Source: ${b.sourceName} | ID: ${b.datasetId.ifBlank { "SIMULATED" }}", color = TextMuted, fontSize = 10.sp)
                         Text("Scope: ${b.evaluationScope}", color = QuantCyan, fontSize = 10.sp)
+                        Text(
+                            text = "Quality: ${b.researchQualityStatus.name}",
+                            color = if (b.researchQualityStatus == ResearchQualityStatus.RESEARCH_GRADE) QuantGreen else QuantGold,
+                            fontSize = 9.sp,
+                            fontFamily = FontFamily.Monospace
+                        )
+                        Text("Exec: ${b.executionAssumption}", color = TextSubtle, fontSize = 9.sp)
+                        if (b.costModelSummary.isNotBlank()) {
+                            Text("Costs: ${b.costModelSummary}", color = TextSubtle, fontSize = 9.sp)
+                        }
                         if (b.startTimestamp > 0L && b.endTimestamp > 0L) {
                             Text("Range: ${formatBacktestRange(b.startTimestamp, b.endTimestamp)}", color = TextSubtle, fontSize = 9.sp, fontFamily = FontFamily.Monospace)
                         }
@@ -757,13 +787,23 @@ fun StrategyLabScreen(viewModel: TradingViewModel) {
                         Column(horizontalAlignment = Alignment.End) {
                             Text("Sharpe Ratio", color = TextMuted, fontSize = 11.sp)
                             Text(
-                                text = String.format("%.2f", b.sharpeRatio),
-                                color = QuantCyan,
+                                text = b.sharpeRatio?.let { String.format("%.2f", it) } ?: "N/A",
+                                color = if (b.sharpeRatio != null) QuantCyan else QuantGold,
                                 fontSize = 14.sp,
                                 fontFamily = FontFamily.Monospace,
                                 fontWeight = FontWeight.Bold
                             )
                         }
+                    }
+
+                    if (b.sharpeStatusReason.isNotBlank()) {
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "Sharpe note: ${b.sharpeStatusReason}",
+                            color = if (b.sharpeRatio != null) TextSubtle else QuantGold,
+                            fontSize = 9.sp,
+                            fontFamily = FontFamily.Monospace
+                        )
                     }
 
                     Spacer(modifier = Modifier.height(8.dp))

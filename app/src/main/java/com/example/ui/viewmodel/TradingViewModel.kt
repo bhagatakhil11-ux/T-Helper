@@ -14,6 +14,8 @@ import com.example.data.model.AuditLogEntry
 import com.example.data.model.BacktestResult
 import com.example.data.model.BatchHistoricalImportResult
 import com.example.data.model.Candle
+import com.example.data.model.DataOrigin
+import com.example.data.model.DataQualityThresholds
 import com.example.data.model.DecisionSignal
 import com.example.data.model.FeedStatus
 import com.example.data.model.HistoricalDatasetMetadata
@@ -24,7 +26,9 @@ import com.example.data.model.MlValidationReport
 import com.example.data.model.Order
 import com.example.data.model.Portfolio
 import com.example.data.model.Position
+import com.example.data.model.ResearchQualityStatus
 import com.example.data.model.RiskSettings
+import com.example.data.model.VerificationStatus
 import com.example.data.repository.HistoricalCsvImporter
 import com.example.data.repository.MarketRepository
 import com.example.engine.agent.AutonomousTradingAgent
@@ -75,6 +79,8 @@ class TradingViewModel(
     val instruments: StateFlow<List<MarketInstrument>> = marketRepository.instruments
     val currentSession: StateFlow<MarketSession> = agent.currentSession
     val feedStatus: StateFlow<FeedStatus> = marketRepository.feedStatus
+    val dataOrigin: StateFlow<DataOrigin> = marketRepository.dataOrigin
+    val verificationStatus: StateFlow<VerificationStatus> = marketRepository.verificationStatus
     val dataSourceName: StateFlow<String> = marketRepository.dataSourceName
     val historicalDatasets: StateFlow<Map<String, HistoricalDatasetMetadata>> = marketRepository.historicalDatasets
 
@@ -149,12 +155,11 @@ class TradingViewModel(
         currentCandles,
         _selectedSymbol,
         _selectedTimeframe,
+        historicalDatasets,
         _mlRefreshTrigger
-    ) { candles, sym, tf, _ ->
-        val rep = mlEngine.getValidationReport()
-        val matches = rep == null || rep.trainedSymbol == "UNKNOWN" ||
-            (rep.trainedSymbol == sym && rep.timeframe == tf)
-        if (candles.size >= 26 && matches) {
+    ) { candles, sym, tf, _, _ ->
+        val prov = marketRepository.getDatasetProvenance(sym, tf)
+        if (candles.size >= 26 && mlEngine.isModelValidFor(sym, tf, prov)) {
             mlEngine.predict(candles)
         } else null
     }
@@ -170,13 +175,21 @@ class TradingViewModel(
 
             val persisted = withContext(Dispatchers.IO) { modelStore?.load() }
             if (persisted != null) {
-                mlEngine.loadPersistedModel(persisted)
                 val rep = persisted.validationReport
-                _mlValidationReport.value = rep
-                val accPct = String.format("%.1f", rep.testAccuracy * 100.0)
-                val dataTag = if (rep.isSyntheticData) "SIMULATED" else "HISTORICAL"
-                _lastMlTrainingSummary.value =
-                    "Loaded ${rep.modelVersion} ($dataTag ${rep.trainedSymbol} ${rep.timeframe}) | OOS Acc: $accPct% (${rep.testSamples} test / ${rep.trainSamples} train)"
+                val currentProv = marketRepository.getDatasetProvenance(rep.trainedSymbol, rep.timeframe)
+                mlEngine.loadPersistedModel(persisted)
+                if (mlEngine.isModelValidFor(rep.trainedSymbol, rep.timeframe, currentProv)) {
+                    _mlValidationReport.value = rep
+                    val accPct = String.format("%.1f", rep.testAccuracy * 100.0)
+                    _lastMlTrainingSummary.value =
+                        "Loaded ${rep.modelVersion} [${rep.verificationStatus.name} | ${rep.trainedSymbol} ${rep.timeframe}] | OOS Acc: $accPct% (${rep.testSamples} test / ${rep.trainSamples} train)"
+                } else {
+                    mlEngine.invalidateModel()
+                    withContext(Dispatchers.IO) { modelStore?.clear() }
+                    _mlValidationReport.value = null
+                    _lastMlTrainingSummary.value =
+                        "Persisted model invalidated (dataset changed, deleted, or feature/model version mismatch) — retrain required."
+                }
                 _mlRefreshTrigger.value = System.currentTimeMillis()
             }
             runBacktest(_selectedSymbol.value, _selectedTimeframe.value)
@@ -267,12 +280,14 @@ class TradingViewModel(
             }
 
             if (result.success) {
-                withContext(Dispatchers.IO) {
-                    for (ds in result.importedDatasets) {
-                        val meta = ds.metadata ?: continue
-                        marketRepository.persistAndIngestHistoricalDataset(meta, ds.candles)
-                    }
+                val batchPairs = result.importedDatasets.mapNotNull { ds ->
+                    ds.metadata?.let { meta -> meta to ds.candles }
                 }
+                withContext(Dispatchers.IO) {
+                    marketRepository.persistAndIngestHistoricalBatch(batchPairs)
+                }
+                invalidateStaleModelIfAffected(batchPairs.map { it.first.symbol to it.first.timeframe })
+
                 val primary = result.importedDatasets.firstOrNull()
                 if (primary != null) {
                     _selectedSymbol.value = primary.symbol
@@ -307,12 +322,14 @@ class TradingViewModel(
                 )
             }
             if (result.success) {
-                withContext(Dispatchers.IO) {
-                    for (ds in result.importedDatasets) {
-                        val meta = ds.metadata ?: continue
-                        marketRepository.persistAndIngestHistoricalDataset(meta, ds.candles)
-                    }
+                val batchPairs = result.importedDatasets.mapNotNull { ds ->
+                    ds.metadata?.let { meta -> meta to ds.candles }
                 }
+                withContext(Dispatchers.IO) {
+                    marketRepository.persistAndIngestHistoricalBatch(batchPairs)
+                }
+                invalidateStaleModelIfAffected(batchPairs.map { it.first.symbol to it.first.timeframe })
+
                 val primary = result.importedDatasets.firstOrNull()
                 if (primary != null) {
                     _selectedSymbol.value = primary.symbol
@@ -348,8 +365,27 @@ class TradingViewModel(
             withContext(Dispatchers.IO) {
                 marketRepository.deleteHistoricalDataset(symbol, timeframe)
             }
+            invalidateStaleModelIfAffected(listOf(symbol.trim().uppercase() to timeframe))
             marketRepository.refreshProvenance(_selectedSymbol.value, _selectedTimeframe.value)
             _mlRefreshTrigger.value = System.currentTimeMillis()
+            if (_selectedSymbol.value == symbol.trim().uppercase() && _selectedTimeframe.value == timeframe) {
+                runBacktest(_selectedSymbol.value, _selectedTimeframe.value)
+            }
+        }
+    }
+
+    private suspend fun invalidateStaleModelIfAffected(affectedKeys: List<Pair<String, String>>) {
+        val rep = mlEngine.getValidationReport() ?: return
+        val impacted = affectedKeys.any { (sym, tf) ->
+            rep.trainedSymbol == sym && (rep.timeframe == tf || tf == "1m" || tf == "5m")
+        }
+        val prov = marketRepository.getDatasetProvenance(rep.trainedSymbol, rep.timeframe)
+        if (impacted || !mlEngine.isModelValidFor(rep.trainedSymbol, rep.timeframe, prov)) {
+            mlEngine.invalidateModel()
+            _mlValidationReport.value = null
+            _lastMlTrainingSummary.value =
+                "Model invalidated (${rep.trainedSymbol} ${rep.timeframe}): underlying dataset was replaced or deleted — retrain required."
+            withContext(Dispatchers.IO) { modelStore?.clear() }
         }
     }
 
@@ -379,7 +415,7 @@ class TradingViewModel(
                 val sourceLabel = prov?.sourceName ?: "NSE Paper Market Feed (Simulated)"
 
                 val rep = mlEngine.getValidationReport()
-                val matchesTrained = rep != null && rep.trainedSymbol == symbol && rep.timeframe == timeframe
+                val matchesTrained = mlEngine.isModelValidFor(symbol, timeframe, prov) && rep != null
                 val startIndex = if (unseenTestOnly && matchesTrained && rep!!.testStartCandleIndex >= 25) {
                     rep.testStartCandleIndex
                 } else {
@@ -387,11 +423,11 @@ class TradingViewModel(
                 }
                 val scopeLabel = when {
                     unseenTestOnly && matchesTrained && rep!!.testStartCandleIndex >= 25 ->
-                        "Unseen Test Split Only (bars ${rep.testStartCandleIndex}..${candles.size - 1})"
+                        "Fixed Holdout Unseen Test Split (bars ${rep.testStartCandleIndex}..${candles.size - 1})"
                     matchesTrained ->
-                        "Full Series (includes Train/Val bars; toggle Unseen Test Only for OOS)"
+                        "Single-Series Simulation (includes Train/Val bars; enable Unseen Test Split for OOS)"
                     else ->
-                        "Full Series"
+                        "Single-Series Simulation (Rule Strategies; ML Unbound)"
                 }
 
                 backtestEngine.runBacktest(
@@ -402,7 +438,8 @@ class TradingViewModel(
                     timeframe = timeframe,
                     sourceName = sourceLabel,
                     startBarIndex = startIndex,
-                    evaluationScope = scopeLabel
+                    evaluationScope = scopeLabel,
+                    datasetMeta = prov
                 )
             }
             _backtestResult.value = result
@@ -413,24 +450,30 @@ class TradingViewModel(
     fun trainMlModel(symbol: String) {
         viewModelScope.launch {
             _isTrainingMl.value = true
+            val requestedTf = _selectedTimeframe.value
+            val candles = marketRepository.getCandles(symbol, requestedTf)
+            if (candles.size < DataQualityThresholds.MIN_SMOKE_TEST_BARS) {
+                _lastMlTrainingSummary.value =
+                    "Training skipped ($symbol $requestedTf): ${candles.size} bars available, >= ${DataQualityThresholds.MIN_SMOKE_TEST_BARS} smoke-test minimum required (research grade: >= ${DataQualityThresholds.requiredResearchBars(requestedTf)} bars)."
+                _isTrainingMl.value = false
+                return@launch
+            }
+
             val outcome = withContext(Dispatchers.Default) {
-                val requestedTf = _selectedTimeframe.value
-                val tfCandles = marketRepository.getCandles(symbol, requestedTf)
-                val (trainTf, candles) = if (tfCandles.size >= 80) {
-                    requestedTf to tfCandles
-                } else {
-                    "1m" to marketRepository.getCandles(symbol, "1m")
-                }
+                val datasetMeta = marketRepository.getDatasetProvenance(symbol, requestedTf)
                 mlEngine.trainAndValidate(
                     candles = candles,
                     symbol = symbol,
-                    timeframe = trainTf
+                    timeframe = requestedTf,
+                    datasetMeta = datasetMeta
                 )
             }
             if (outcome != null) {
                 val rep = outcome.report
                 _mlValidationReport.value = rep
-                val dataTag = if (rep.isSyntheticData) "SIMULATED" else "HISTORICAL"
+                val qualityNote = if (rep.researchQualityStatus == ResearchQualityStatus.LOW_CONFIDENCE_INSUFFICIENT_DATA) {
+                    " [LOW_CONFIDENCE_INSUFFICIENT_DATA: ${candles.size}/${rep.researchMinRequiredBars} research bars]"
+                } else ""
                 if (outcome.deployed) {
                     withContext(Dispatchers.IO) {
                         mlEngine.exportPersistedModel()?.let { modelStore?.save(it) }
@@ -438,15 +481,16 @@ class TradingViewModel(
                     val accPct = String.format("%.1f", rep.testAccuracy * 100.0)
                     val majPct = String.format("%.1f", rep.baselineMajorityAccuracy * 100.0)
                     _lastMlTrainingSummary.value =
-                        "Deployed ${rep.modelVersion} [$dataTag $symbol ${rep.timeframe}] | Test Acc: $accPct% vs Maj $majPct% (${rep.trainSamples}/${rep.validationSamples}/${rep.testSamples} split, ${rep.purgedSamples} purged)"
+                        "Deployed ${rep.modelVersion} [${rep.verificationStatus.name} | $symbol ${rep.timeframe}]$qualityNote | OOS Acc: $accPct% vs Maj $majPct% (${rep.trainSamples}/${rep.validationSamples}/${rep.testSamples} split, ${rep.purgedSamples} purged)"
                 } else {
                     _lastMlTrainingSummary.value =
-                        "Gate Rejected [$dataTag $symbol ${rep.timeframe}]: ${rep.validationGateReason}"
+                        "Gate Rejected [${rep.verificationStatus.name} | $symbol ${rep.timeframe}]$qualityNote: ${rep.validationGateReason}"
                 }
                 _mlRefreshTrigger.value = System.currentTimeMillis()
                 runBacktest(symbol, rep.timeframe, _unseenTestBacktestOnly.value)
             } else {
-                _lastMlTrainingSummary.value = "Training skipped: insufficient candles for purged Train/Val/Test split (>= 80 bars required)."
+                _lastMlTrainingSummary.value =
+                    "Training skipped: insufficient labeled samples for purged Train/Val/Test split."
             }
             _isTrainingMl.value = false
         }

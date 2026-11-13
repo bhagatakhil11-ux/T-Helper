@@ -57,6 +57,7 @@ import com.example.data.model.AgentStatus
 import com.example.data.model.DecisionType
 import com.example.data.model.FeedStatus
 import com.example.data.model.MarketSession
+import com.example.data.model.VerificationStatus
 import com.example.data.model.formatInr
 import com.example.ui.components.CandleStickChart
 import com.example.ui.theme.CardBorder
@@ -92,6 +93,7 @@ fun TerminalScreen(viewModel: TradingViewModel) {
     val auditLogs by viewModel.auditLogs.collectAsState()
     val currentSession by viewModel.currentSession.collectAsState()
     val feedStatus by viewModel.feedStatus.collectAsState()
+    val verificationStatus by viewModel.verificationStatus.collectAsState()
     val dataSourceName by viewModel.dataSourceName.collectAsState()
 
     var showIndicatorOverlay by remember { mutableStateOf(true) }
@@ -187,20 +189,24 @@ fun TerminalScreen(viewModel: TradingViewModel) {
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                val feedColor = when (feedStatus) {
-                    FeedStatus.LIVE -> QuantGreen
-                    FeedStatus.SIMULATED -> QuantGold
-                    FeedStatus.HISTORICAL -> QuantCyan
-                    FeedStatus.DELAYED -> Color(0xFFFF9800)
-                    FeedStatus.DISCONNECTED -> QuantRed
+            Row(
+                modifier = Modifier.weight(1f),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                val feedColor = when {
+                    verificationStatus == VerificationStatus.VERIFIED_EXCHANGE_OR_VENDOR && feedStatus == FeedStatus.LIVE -> QuantGreen
+                    verificationStatus == VerificationStatus.VERIFIED_EXCHANGE_OR_VENDOR && feedStatus == FeedStatus.HISTORICAL -> QuantGreen
+                    verificationStatus == VerificationStatus.IMPORTED_CSV_UNVERIFIED -> QuantCyan
+                    feedStatus == FeedStatus.DELAYED -> Color(0xFFFF9800)
+                    feedStatus == FeedStatus.DISCONNECTED -> QuantRed
+                    else -> QuantGold
                 }
                 Box(modifier = Modifier.size(7.dp).background(feedColor, CircleShape))
                 Spacer(modifier = Modifier.width(6.dp))
                 Text(
-                    text = "${feedStatus.name}: $dataSourceName",
+                    text = "${feedStatus.name} [${verificationStatus.name}]: $dataSourceName",
                     color = feedColor,
-                    fontSize = 11.sp,
+                    fontSize = 10.sp,
                     fontWeight = FontWeight.SemiBold
                 )
             }

@@ -155,13 +155,15 @@ class AutonomousTradingAgent(
 
         _agentStatus.value = AgentStatus.ANALYZING
 
-        // 6. Evaluate Strategy Ensemble with Machine Learning
+        // 6. Evaluate Strategy Ensemble with Machine Learning (strictly bound to current dataset provenance)
         val signal = decisionEngine.evaluate(
             instrument = targetInstrument,
             candles = candles,
             riskSettings = _riskSettings.value,
             availableCash = _portfolio.value.availableCash,
-            marketSession = _currentSession.value
+            marketSession = _currentSession.value,
+            timeframe = "1m",
+            datasetMeta = marketRepository.getDatasetProvenance(symbol, "1m")
         )
         _lastDecision.value = signal
 

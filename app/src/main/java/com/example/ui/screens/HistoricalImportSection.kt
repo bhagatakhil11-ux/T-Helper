@@ -61,7 +61,11 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.data.model.BatchHistoricalImportResult
+import com.example.data.model.DataOrigin
+import com.example.data.model.DataQualityThresholds
 import com.example.data.model.HistoricalDatasetMetadata
+import com.example.data.model.ResearchQualityStatus
+import com.example.data.model.VerificationStatus
 import com.example.data.repository.HistoricalCsvImporter
 import com.example.ui.theme.CardBorder
 import com.example.ui.theme.CardDark
@@ -152,9 +156,13 @@ fun HistoricalImportSection(viewModel: TradingViewModel) {
         ) {
             // Active Feed Provenance Banner
             val prov = activeProvenance
-            val isHistorical = prov != null
-            val badgeBg = if (isHistorical) QuantGreenDim else Color(0x33FFC107)
-            val badgeColor = if (isHistorical) QuantGreen else QuantGold
+            val verification = prov?.verificationStatus ?: VerificationStatus.SIMULATED_NOT_REAL
+            val (badgeText, badgeColor, badgeBg) = when (verification) {
+                VerificationStatus.VERIFIED_EXCHANGE_OR_VENDOR -> Triple("VERIFIED HISTORICAL", QuantGreen, QuantGreenDim)
+                VerificationStatus.IMPORTED_CSV_UNVERIFIED -> Triple("IMPORTED_CSV_UNVERIFIED", QuantCyan, QuantCyanDim)
+                VerificationStatus.TEST_FIXTURE_NOT_MARKET_DATA -> Triple("TEST_FIXTURE (NOT REAL)", QuantGold, Color(0x33FFC107))
+                VerificationStatus.SIMULATED_NOT_REAL -> Triple("SIMULATED (NOT REAL)", QuantGold, Color(0x33FFC107))
+            }
 
             Row(
                 modifier = Modifier
@@ -173,7 +181,7 @@ fun HistoricalImportSection(viewModel: TradingViewModel) {
                                 .padding(horizontal = 6.dp, vertical = 2.dp)
                         ) {
                             Text(
-                                text = if (isHistorical) "HISTORICAL DATA" else "SIMULATED DATA",
+                                text = badgeText,
                                 color = badgeColor,
                                 fontSize = 10.sp,
                                 fontWeight = FontWeight.Bold
@@ -189,22 +197,45 @@ fun HistoricalImportSection(viewModel: TradingViewModel) {
                     }
                     Spacer(modifier = Modifier.height(4.dp))
                     if (prov != null) {
+                        val reqBars = DataQualityThresholds.requiredResearchBars(prov.timeframe)
+                        val qualityStatus = DataQualityThresholds.evaluateQuality(prov.candleCount, prov.timeframe)
                         Text(
                             text = "${prov.sourceName} | ${prov.candleCount} bars | ${formatIstRange(prov.startTimestamp, prov.endTimestamp)}",
                             color = TextMuted,
                             fontSize = 10.sp
                         )
-                        if (prov.missingCandleCount > 0) {
+                        Text(
+                            text = "ID: ${prov.datasetId} | SHA256: ${prov.sha256Checksum.take(12)} | TZ: ${prov.timezone} | Adj: ${prov.adjustmentPolicy.name}",
+                            color = TextSubtle,
+                            fontSize = 9.sp,
+                            fontFamily = FontFamily.Monospace
+                        )
+                        if (qualityStatus == ResearchQualityStatus.LOW_CONFIDENCE_INSUFFICIENT_DATA) {
                             Text(
-                                text = "Data gaps detected: ${prov.missingCandleCount} missing bar(s)",
+                                text = "LOW_CONFIDENCE_INSUFFICIENT_DATA: ${prov.candleCount}/$reqBars research-grade bars for ${prov.timeframe}",
                                 color = QuantGold,
                                 fontSize = 10.sp,
                                 fontWeight = FontWeight.SemiBold
                             )
                         }
+                        if (prov.missingCandleCount > 0 || prov.holidaySkippedCount > 0) {
+                            Text(
+                                text = "Gaps: ${prov.missingCandleCount} missing bar(s) | NSE holidays skipped: ${prov.holidaySkippedCount}",
+                                color = if (prov.missingCandleCount > 0) QuantGold else TextSubtle,
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                        if (prov.corporateActionFlags.isNotEmpty()) {
+                            Text(
+                                text = "Corporate-action / jump flag(s): ${prov.corporateActionFlags.size} (${prov.corporateActionFlags.first()})",
+                                color = QuantGold,
+                                fontSize = 9.sp
+                            )
+                        }
                     } else {
                         Text(
-                            text = "No genuine historical CSV imported for $selectedSymbol ($selectedTimeframe). Synthetic paper feed active.",
+                            text = "No historical CSV imported for $selectedSymbol ($selectedTimeframe). Synthetic paper feed active (not real NSE market history).",
                             color = TextMuted,
                             fontSize = 10.sp
                         )
@@ -586,6 +617,13 @@ private fun StoredDatasetRow(
         verticalAlignment = Alignment.CenterVertically
     ) {
         Column(modifier = Modifier.weight(1f)) {
+            val (dsBadgeLabel, dsBadgeColor, dsBadgeBg) = when (dataset.verificationStatus) {
+                VerificationStatus.VERIFIED_EXCHANGE_OR_VENDOR -> Triple("VERIFIED", QuantGreen, QuantGreenDim)
+                VerificationStatus.IMPORTED_CSV_UNVERIFIED -> Triple("CSV_UNVERIFIED", QuantCyan, QuantCyanDim)
+                VerificationStatus.TEST_FIXTURE_NOT_MARKET_DATA -> Triple("TEST_FIXTURE", QuantGold, Color(0x33FFC107))
+                VerificationStatus.SIMULATED_NOT_REAL -> Triple("SIMULATED", QuantGold, Color(0x33FFC107))
+            }
+            val rowQuality = DataQualityThresholds.evaluateQuality(dataset.candleCount, dataset.timeframe)
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
                     text = "${dataset.symbol} • ${dataset.timeframe}",
@@ -596,10 +634,10 @@ private fun StoredDatasetRow(
                 Spacer(modifier = Modifier.width(6.dp))
                 Box(
                     modifier = Modifier
-                        .background(QuantGreenDim, RoundedCornerShape(4.dp))
+                        .background(dsBadgeBg, RoundedCornerShape(4.dp))
                         .padding(horizontal = 5.dp, vertical = 1.dp)
                 ) {
-                    Text("HISTORICAL", color = QuantGreen, fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                    Text(dsBadgeLabel, color = dsBadgeColor, fontSize = 9.sp, fontWeight = FontWeight.Bold)
                 }
                 if (dataset.missingCandleCount > 0) {
                     Spacer(modifier = Modifier.width(6.dp))
@@ -607,9 +645,15 @@ private fun StoredDatasetRow(
                 }
             }
             Text(
-                text = "${dataset.candleCount} bars | ${dataset.sourceName}",
+                text = "${dataset.candleCount} bars | ${dataset.sourceName} | ${rowQuality.name}",
                 color = TextMuted,
                 fontSize = 10.sp
+            )
+            Text(
+                text = "ID: ${dataset.datasetId.ifBlank { "--" }} | SHA256: ${dataset.sha256Checksum.take(10)} | TZ: ${dataset.timezone} | Adj: ${dataset.adjustmentPolicy.name}",
+                color = TextSubtle,
+                fontSize = 9.sp,
+                fontFamily = FontFamily.Monospace
             )
             Text(
                 text = formatIstRange(dataset.startTimestamp, dataset.endTimestamp),

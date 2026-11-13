@@ -4,6 +4,7 @@ import com.example.data.model.Candle
 import com.example.data.model.DecisionSignal
 import com.example.data.model.DecisionType
 import com.example.data.model.FeedStatus
+import com.example.data.model.HistoricalDatasetMetadata
 import com.example.data.model.MarketInstrument
 import com.example.data.model.MarketSession
 import com.example.data.model.MlMovementClass
@@ -323,7 +324,9 @@ class EnsembleDecisionEngine(
         candles: List<Candle>,
         riskSettings: RiskSettings,
         availableCash: Double,
-        marketSession: MarketSession = MarketSession.REGULAR_HOURS
+        marketSession: MarketSession = MarketSession.REGULAR_HOURS,
+        timeframe: String = "1m",
+        datasetMeta: HistoricalDatasetMetadata? = null
     ): DecisionSignal {
         val symbol = instrument.symbol
         val currentPrice = instrument.currentPrice
@@ -385,10 +388,10 @@ class EnsembleDecisionEngine(
         }
         val techCompositeScore = if (totalWeight > 0) weightedScoreSum / totalWeight else 0.0
 
-        // 4. Evaluate Machine Learning Prediction Engine (only apply if trained for this symbol to prevent cross-symbol leakage)
+        // 4. Evaluate Machine Learning Prediction Engine (strictly bound by symbol + timeframe + datasetId + featureVersion + modelVersion)
         val trainedReport = mlEngine.getValidationReport()
-        val symbolMatches = trainedReport == null || trainedReport.trainedSymbol == "UNKNOWN" || trainedReport.trainedSymbol == symbol
-        val mlPred = if (symbolMatches) mlEngine.predict(candles) else null
+        val bindingMatches = mlEngine.isModelValidFor(symbol, timeframe, datasetMeta)
+        val mlPred = if (bindingMatches) mlEngine.predict(candles) else null
         val mlActive = mlPred != null && mlPred.isTrained
         val mlScore = if (mlActive) {
             val pUp = mlPred!!.probUpward
@@ -454,8 +457,8 @@ class EnsembleDecisionEngine(
                 rationaleBuilder.append(bullishStrategies.joinToString(" | ") { "${it.strategyName}: ${it.rationale}" })
                 if (mlActive) {
                     rationaleBuilder.append(" [ML ${mlPred!!.modelVersion}: P(Up)=${String.format("%.0f", mlPred.probUpward * 100)}%, P(Down)=${String.format("%.0f", mlPred.probDownward * 100)}%]")
-                } else if (mlPred?.isTrained == true && !symbolMatches) {
-                    rationaleBuilder.append(" [ML trained on ${trainedReport?.trainedSymbol}, skipped for $symbol]")
+                } else if (trainedReport != null && !bindingMatches) {
+                    rationaleBuilder.append(" [ML trained on ${trainedReport.trainedSymbol}/${trainedReport.timeframe}, skipped for $symbol/$timeframe]")
                 } else {
                     rationaleBuilder.append(" [ML Untrained]")
                 }
@@ -469,8 +472,8 @@ class EnsembleDecisionEngine(
                 rationaleBuilder.append(bearishStrategies.joinToString(" | ") { "${it.strategyName}: ${it.rationale}" })
                 if (mlActive) {
                     rationaleBuilder.append(" [ML ${mlPred!!.modelVersion}: P(Down)=${String.format("%.0f", mlPred.probDownward * 100)}%]")
-                } else if (mlPred?.isTrained == true && !symbolMatches) {
-                    rationaleBuilder.append(" [ML trained on ${trainedReport?.trainedSymbol}, skipped for $symbol]")
+                } else if (trainedReport != null && !bindingMatches) {
+                    rationaleBuilder.append(" [ML trained on ${trainedReport.trainedSymbol}/${trainedReport.timeframe}, skipped for $symbol/$timeframe]")
                 } else {
                     rationaleBuilder.append(" [ML Untrained]")
                 }

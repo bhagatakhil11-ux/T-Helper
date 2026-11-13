@@ -8,25 +8,60 @@ import com.example.data.model.Position
 import java.util.UUID
 import kotlin.random.Random
 
+data class CostModelConfig(
+    val effectiveDate: String = "2025-10-01",
+    val isIntraday: Boolean = true,
+    val deliverySttRate: Double = 0.0010,       // 0.10% Buy & Sell
+    val intradaySellSttRate: Double = 0.00025, // 0.025% Sell-side only
+    val exchangeTurnoverRate: Double = 0.0000325, // NSE Equity CM: 0.00325% (effective Oct 2024+)
+    val sebiFeeRate: Double = 0.0000010,       // ₹10 per crore
+    val stampDutyBuyRate: Double = 0.00015,    // 0.015% delivery / 0.003% intraday (conservative 0.015% default unless intraday flag used)
+    val stampDutyIntradayBuyRate: Double = 0.00003,
+    val flatBrokeragePerOrderInr: Double = 20.0, // Typical NSE discount broker cap ₹20/order (or 0.03% whichever lower)
+    val brokeragePctCap: Double = 0.0003,
+    val gstRate: Double = 0.18,                // 18% on (Brokerage + Exchange + SEBI)
+    val slippagePercent: Double = 0.0003       // 3 bps default market-impact slippage per fill
+) {
+    fun summary(): String {
+        val mode = if (isIntraday) "Intraday" else "Delivery"
+        return "NSE $mode (Effective $effectiveDate): Slippage=${String.format("%.2f", slippagePercent * 100)}%, Brok=min(₹${flatBrokeragePerOrderInr.toInt()}, 0.03%), STT=${if (isIntraday) "0.025% sell" else "0.10%"}, Exch+SEBI+Stamp+18%GST"
+    }
+}
+
 data class IndianStatutoryLevies(
-    val stt: Double,               // Securities Transaction Tax: 0.1% for Delivery, 0.025% for Intraday Sell
-    val exchangeTurnoverCharge: Double, // NSE: 0.00345%
-    val sebiTurnoverFee: Double,   // ₹10 per crore (0.0001%)
-    val stampDuty: Double,         // 0.015% on Buy orders only
-    val gst: Double,               // 18% on (Exchange turnover + SEBI turnover)
+    val stt: Double,
+    val brokerage: Double,
+    val exchangeTurnoverCharge: Double,
+    val sebiTurnoverFee: Double,
+    val stampDuty: Double,
+    val gst: Double,
     val totalLevies: Double
 ) {
     companion object {
-        fun calculate(turnover: Double, isBuy: Boolean): IndianStatutoryLevies {
-            val stt = turnover * 0.0010
-            val exchange = turnover * 0.0000345
-            val sebi = turnover * 0.0000010
-            val stamp = if (isBuy) turnover * 0.00015 else 0.0
-            val gst = (exchange + sebi) * 0.18
-            val total = stt + exchange + sebi + stamp + gst
+        fun calculate(
+            turnover: Double,
+            isBuy: Boolean,
+            config: CostModelConfig = CostModelConfig(isIntraday = false, flatBrokeragePerOrderInr = 0.0, brokeragePctCap = 0.0, exchangeTurnoverRate = 0.0000345)
+        ): IndianStatutoryLevies {
+            val stt = if (config.isIntraday) {
+                if (isBuy) 0.0 else turnover * config.intradaySellSttRate
+            } else {
+                turnover * config.deliverySttRate
+            }
+            val brokerage = if (turnover > 0.0 && config.flatBrokeragePerOrderInr > 0.0) {
+                minOf(config.flatBrokeragePerOrderInr, turnover * config.brokeragePctCap)
+            } else 0.0
+            val exchange = turnover * config.exchangeTurnoverRate
+            val sebi = turnover * config.sebiFeeRate
+            val stamp = if (isBuy) {
+                turnover * (if (config.isIntraday) config.stampDutyIntradayBuyRate else config.stampDutyBuyRate)
+            } else 0.0
+            val gst = (brokerage + exchange + sebi) * config.gstRate
+            val total = stt + brokerage + exchange + sebi + stamp + gst
 
             return IndianStatutoryLevies(
                 stt = stt,
+                brokerage = brokerage,
                 exchangeTurnoverCharge = exchange,
                 sebiTurnoverFee = sebi,
                 stampDuty = stamp,

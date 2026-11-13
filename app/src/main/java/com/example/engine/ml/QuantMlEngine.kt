@@ -1,11 +1,15 @@
 package com.example.engine.ml
 
 import com.example.data.model.Candle
+import com.example.data.model.DataOrigin
+import com.example.data.model.DataQualityThresholds
 import com.example.data.model.FeedStatus
+import com.example.data.model.HistoricalDatasetMetadata
 import com.example.data.model.MlClassMetrics
 import com.example.data.model.MlMovementClass
 import com.example.data.model.MlPrediction
 import com.example.data.model.MlValidationReport
+import com.example.data.model.VerificationStatus
 import com.example.engine.indicators.TechnicalIndicators
 import kotlin.math.abs
 import kotlin.math.ln
@@ -98,6 +102,10 @@ data class MlTrainingOutcome(
 class QuantMlEngine(
     val modelVersion: String = "QuantAI-RF-v2.0"
 ) {
+    companion object {
+        const val FEATURE_VERSION = "features-v1.0"
+    }
+
     private val lock = Any()
 
     @Volatile
@@ -115,6 +123,40 @@ class QuantMlEngine(
     fun getValidationReport(): MlValidationReport? = lastReport
 
     fun getFeatureImportances(): Map<String, Double> = featureImportances
+
+    fun invalidateModel() {
+        synchronized(lock) {
+            forestTrees = emptyList()
+            featureImportances = emptyMap()
+            lastReport = null
+        }
+    }
+
+    /**
+     * Enforces strict binding across symbol + timeframe + datasetId/checksum + featureVersion + modelVersion.
+     * Prevents stale or cross-dataset/cross-symbol/cross-timeframe predictions after dataset replacement or deletion.
+     */
+    fun isModelValidFor(
+        symbol: String,
+        timeframe: String,
+        datasetMeta: HistoricalDatasetMetadata? = null
+    ): Boolean {
+        val rep = lastReport ?: return false
+        if (forestTrees.isEmpty()) return false
+        if (rep.modelVersion != modelVersion) return false
+        if (rep.featureVersion != FEATURE_VERSION) return false
+
+        val symMatch = rep.trainedSymbol == symbol || (rep.trainedSymbol == "UNKNOWN" && datasetMeta == null)
+        if (!symMatch) return false
+        if (rep.timeframe != timeframe) return false
+
+        return if (datasetMeta != null) {
+            rep.datasetId == datasetMeta.datasetId &&
+                (datasetMeta.sha256Checksum.isBlank() || rep.datasetChecksum == datasetMeta.sha256Checksum)
+        } else {
+            rep.datasetId.isEmpty() && rep.sourceType == DataOrigin.SIMULATED
+        }
+    }
 
     /**
      * Extracts causal feature vector at candle index `atIndex` using ONLY candles[0..atIndex].
@@ -343,7 +385,9 @@ class QuantMlEngine(
         maxDepth: Int = 5,
         minSamplesSplit: Int = 8,
         minLeafSamples: Int = 3,
-        seed: Long = 42L
+        seed: Long = 42L,
+        datasetMeta: HistoricalDatasetMetadata? = null,
+        researchMinBarsOverrides: Map<String, Int> = DataQualityThresholds.defaultResearchMinBars
     ): MlTrainingOutcome? {
         val dataset = generateDataset(
             candles = candles,
@@ -356,7 +400,20 @@ class QuantMlEngine(
         // Need enough samples for 60/20/20 split with 2 purge gaps
         if (n < 40 + 2 * purgeGap) return null
 
-        val isSynthetic = candles.any { it.feedStatus == FeedStatus.SIMULATED }
+        val resolvedOrigin = datasetMeta?.sourceType ?: if (candles.any { it.feedStatus == FeedStatus.SIMULATED }) {
+            DataOrigin.SIMULATED
+        } else {
+            DataOrigin.IMPORTED_CSV
+        }
+        val resolvedVerification = datasetMeta?.verificationStatus ?: when (resolvedOrigin) {
+            DataOrigin.SIMULATED -> VerificationStatus.SIMULATED_NOT_REAL
+            DataOrigin.TEST_FIXTURE -> VerificationStatus.TEST_FIXTURE_NOT_MARKET_DATA
+            DataOrigin.IMPORTED_CSV -> VerificationStatus.IMPORTED_CSV_UNVERIFIED
+            DataOrigin.BROKER_VENDOR -> VerificationStatus.VERIFIED_EXCHANGE_OR_VENDOR
+        }
+        val isSynthetic = candles.any { it.feedStatus == FeedStatus.SIMULATED } ||
+            resolvedOrigin == DataOrigin.SIMULATED ||
+            resolvedOrigin == DataOrigin.TEST_FIXTURE
 
         val trainEnd = (n * 0.60).toInt()
         val valStart = (trainEnd + purgeGap).coerceAtMost(n)
@@ -418,6 +475,9 @@ class QuantMlEngine(
             "Rejected: ${gateReasons.joinToString("; ")}"
         }
 
+        val reqResearchBars = DataQualityThresholds.requiredResearchBars(timeframe, researchMinBarsOverrides)
+        val researchStatus = DataQualityThresholds.evaluateQuality(candles.size, timeframe, researchMinBarsOverrides)
+
         val report = MlValidationReport(
             modelVersion = modelVersion,
             trainedSymbol = symbol,
@@ -446,7 +506,14 @@ class QuantMlEngine(
             featureImportances = trained.featureImportances,
             passedValidationGate = passedGate,
             validationGateReason = gateReason,
-            testStartCandleIndex = testSet.first().candleIndex
+            testStartCandleIndex = testSet.first().candleIndex,
+            datasetId = datasetMeta?.datasetId ?: "",
+            datasetChecksum = datasetMeta?.sha256Checksum ?: "",
+            featureVersion = FEATURE_VERSION,
+            sourceType = resolvedOrigin,
+            verificationStatus = resolvedVerification,
+            researchQualityStatus = researchStatus,
+            researchMinRequiredBars = reqResearchBars
         )
 
         if (passedGate) {
@@ -485,6 +552,23 @@ class QuantMlEngine(
     }
 
     /**
+     * Context-bound inference enforcing symbol + timeframe + datasetId/checksum + featureVersion + modelVersion.
+     * Returns null when < 26 candles or an explicit untrained placeholder when binding does not match.
+     */
+    fun predictForContext(
+        candles: List<Candle>,
+        symbol: String,
+        timeframe: String,
+        datasetMeta: HistoricalDatasetMetadata? = null
+    ): MlPrediction? {
+        if (!isModelValidFor(symbol, timeframe, datasetMeta)) {
+            if (candles.size < 26) return null
+            return untrainedPlaceholder()
+        }
+        return predict(candles)
+    }
+
+    /**
      * Inference on latest candle in stream. Returns null if fewer than 26 candles.
      * If model is not trained, returns an explicit untrained placeholder (never fake probabilities).
      */
@@ -493,26 +577,35 @@ class QuantMlEngine(
         return predictFromFeatures(features.toArray())
     }
 
+    private fun untrainedPlaceholder(): MlPrediction = MlPrediction(
+        modelVersion = modelVersion,
+        isTrained = false,
+        isSyntheticData = true,
+        probUpward = 1.0 / 3.0,
+        probDownward = 1.0 / 3.0,
+        probSideways = 1.0 / 3.0,
+        predictedClass = MlMovementClass.SIDEWAYS,
+        confidence = 1.0 / 3.0,
+        trainingSampleCount = 0,
+        outOfSampleAccuracy = 0.0,
+        featureImportances = emptyMap(),
+        evaluatedAt = System.currentTimeMillis(),
+        datasetId = "",
+        featureVersion = FEATURE_VERSION,
+        sourceType = DataOrigin.SIMULATED,
+        verificationStatus = VerificationStatus.SIMULATED_NOT_REAL
+    )
+
     fun predictFromFeatures(featArray: DoubleArray): MlPrediction {
         val trees = forestTrees
         val report = lastReport
         val importances = featureImportances
 
-        if (trees.isEmpty() || report == null) {
-            return MlPrediction(
-                modelVersion = modelVersion,
-                isTrained = false,
-                isSyntheticData = true,
-                probUpward = 1.0 / 3.0,
-                probDownward = 1.0 / 3.0,
-                probSideways = 1.0 / 3.0,
-                predictedClass = MlMovementClass.SIDEWAYS,
-                confidence = 1.0 / 3.0,
-                trainingSampleCount = 0,
-                outOfSampleAccuracy = 0.0,
-                featureImportances = emptyMap(),
-                evaluatedAt = System.currentTimeMillis()
-            )
+        if (trees.isEmpty() || report == null ||
+            report.modelVersion != modelVersion ||
+            report.featureVersion != FEATURE_VERSION
+        ) {
+            return untrainedPlaceholder()
         }
 
         val probs = predictForestProbabilities(trees, featArray)
@@ -540,7 +633,11 @@ class QuantMlEngine(
             trainingSampleCount = report.trainSamples,
             outOfSampleAccuracy = report.testAccuracy,
             featureImportances = importances,
-            evaluatedAt = System.currentTimeMillis()
+            evaluatedAt = System.currentTimeMillis(),
+            datasetId = report.datasetId,
+            featureVersion = report.featureVersion,
+            sourceType = report.sourceType,
+            verificationStatus = report.verificationStatus
         )
     }
 
